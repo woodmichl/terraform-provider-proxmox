@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -324,14 +325,14 @@ func Container() *schema.Resource {
 							Type:        schema.TypeString,
 							Description: "The datastore id",
 							Optional:    true,
-							ForceNew:    true,
+							ForceNew:    false,
 							Default:     dvDiskDatastoreID,
 						},
 						mkDiskSize: {
 							Type:             schema.TypeInt,
 							Description:      "The rootfs size in gigabytes",
 							Optional:         true,
-							ForceNew:         true,
+							ForceNew:         false,
 							Default:          dvDiskSize,
 							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(1)),
 						},
@@ -2607,6 +2608,180 @@ func containerRead(ctx context.Context, d *schema.ResourceData, m interface{}) d
 	return diags
 }
 
+func containerUpdateDiskLocationAndSize(
+	ctx context.Context,
+	d *schema.ResourceData,
+	m interface{},
+	reboot bool,
+) diag.Diagnostics {
+	config := m.(proxmoxtf.ProviderConfiguration)
+
+	client, err := config.GetClient()
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	nodeName := d.Get(mkNodeName).(string)
+	started := d.Get(mkStarted).(bool)
+	template := d.Get(mkTemplate).(bool)
+
+	vmID, err := strconv.Atoi(d.Id())
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// Determine if any of the disks are changing location and/or size, and initiate the necessary actions.
+	//nolint: nestif
+	if d.HasChange(mkDisk) {
+		parseDiskInterface := func(input interface{}) (containers.CustomRootFS, diag.Diagnostics) {
+			datastore, ok := input.([]interface{})[0].(map[string]interface{})[mkDiskDatastoreID].(string)
+
+			if !ok {
+				return containers.CustomRootFS{}, diag.Errorf("could not parse diskstore_id from %s", input)
+			}
+
+			sizeAsserted, ok := input.([]interface{})[0].(map[string]interface{})[mkDiskSize].(int)
+
+			if !ok {
+				return containers.CustomRootFS{}, diag.Errorf("could not parse disk size from %s", input)
+			}
+
+			size := types.DiskSizeFromGigabytes(int64(sizeAsserted))
+
+			disk := containers.CustomRootFS{
+				Volume: datastore,
+				Size:   size,
+			}
+
+			return disk, nil
+		}
+		diskOldIface, diskNewIface := d.GetChange(mkDisk)
+		// diskOld := diskOldIface.([]interface{})[0].(map[string]interface{})
+		// diskNew := diskNewIface.([]interface{})[0].(map[string]interface{})
+
+		diskOld, diskDiag := parseDiskInterface(diskOldIface)
+
+		if diskDiag != nil {
+			return diskDiag
+		}
+
+		diskNew, diskDiag := parseDiskInterface(diskNewIface)
+
+		if diskDiag != nil {
+			return diskDiag
+		}
+
+		var diskMoveBodies []*containers.MoveDiskRequestBody
+
+		var diskResizeBodies []*containers.ResizeDiskRequestBody
+
+		shutdownForDisksRequired := false
+
+		if diskOld.Volume != diskNew.Volume {
+			deleteOriginalVolume := types.CustomBool(true)
+
+			diskMoveBodies = append(
+				diskMoveBodies,
+				&containers.MoveDiskRequestBody{
+					DeleteOriginalDisk: &deleteOriginalVolume,
+					Volume:             "rootfs",
+					TargetStorage:      diskNew.Volume,
+				},
+			)
+
+			tflog.Debug(ctx,
+				fmt.Sprintf(
+					"Moving Container %d Root Disk from Volume \"%s\" to Volume \"%s\"",
+					vmID,
+					diskOld.Volume,
+					diskNew.Volume,
+				),
+			)
+
+			// Cannot be done while Container is running.
+			shutdownForDisksRequired = true
+		}
+
+		if *diskOld.Size < *diskNew.Size {
+			diskResizeBodies = append(
+				diskResizeBodies,
+				&containers.ResizeDiskRequestBody{
+					Disk: "rootfs",
+					Size: *diskNew.Size,
+				},
+			)
+		}
+
+		if shutdownForDisksRequired && !template {
+			forceStop := types.CustomBool(true)
+			shutdownTimeout := 300
+
+			err = containerAPI.ShutdownContainer(ctx, &containers.ShutdownRequestBody{
+				ForceStop: &forceStop,
+				Timeout:   &shutdownTimeout,
+			})
+			if err != nil {
+				return diag.FromErr(err)
+			}
+
+			err = containerAPI.WaitForContainerStatus(ctx, "stopped")
+			if err != nil {
+				return diag.FromErr(err)
+			}
+		}
+
+		for _, reqBody := range diskMoveBodies {
+			err = containerAPI.MoveContainerVolume(ctx, reqBody)
+			if err != nil {
+				return diag.FromErr(err)
+			}
+		}
+
+		for _, reqBody := range diskResizeBodies {
+			err = containerAPI.ResizeContainerVolume(ctx, reqBody)
+			if err != nil {
+				return diag.FromErr(err)
+			}
+		}
+
+		if shutdownForDisksRequired && started && !template {
+			err = containerAPI.StartContainer(ctx)
+			if err != nil {
+				return diag.FromErr(err)
+			}
+
+			// This concludes an equivalent of a reboot, avoid doing another.
+			reboot = false
+		}
+	}
+
+	// Perform a regular reboot in case it's necessary and haven't already been done.
+	if reboot {
+		containerStatus, err := containerAPI.GetContainerStatus(ctx)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		if containerStatus.Status != "stopped" {
+			rebootTimeout := 300
+
+			err = containerAPI.RebootContainer(
+				ctx,
+				&containers.RebootRequestBody{
+					Timeout: &rebootTimeout,
+				},
+			)
+			if err != nil {
+				return diag.FromErr(err)
+			}
+		}
+	}
+
+	return containerRead(ctx, d, m)
+}
+
 func containerUpdate(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
 	updateTimeoutSec := d.Get(mkTimeoutUpdate).(int)
 
@@ -3041,22 +3216,14 @@ func containerUpdate(ctx context.Context, d *schema.ResourceData, m interface{})
 		}
 	}
 
-	// As a final step in the update procedure, we might need to reboot the container.
-	if !bool(template) && started && rebootRequired {
-		rebootTimeout := 300
+	tflog.Trace(ctx, "Updating Disk...")
 
-		e = containerAPI.RebootContainer(
-			ctx,
-			&containers.RebootRequestBody{
-				Timeout: &rebootTimeout,
-			},
-		)
-		if e != nil {
-			return diag.FromErr(e)
-		}
-	}
-
-	return containerRead(ctx, d, m)
+	return containerUpdateDiskLocationAndSize(
+		ctx,
+		d,
+		m,
+		!bool(template) && rebootRequired,
+	)
 }
 
 func containerDelete(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {

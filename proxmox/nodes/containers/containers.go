@@ -188,6 +188,84 @@ func (c *Client) UpdateContainer(ctx context.Context, d *UpdateRequestBody) erro
 	return nil
 }
 
+// MoveContainerVolume moves a container volume.
+func (c *Client) MoveContainerVolume(ctx context.Context, d *MoveDiskRequestBody) error {
+	taskID, err := c.MoveContainerVolumeAsync(ctx, d)
+	if err != nil {
+		if strings.Contains(err.Error(), "you can't move to the same storage with same format") {
+			// if someone tries to move to the same storage, the move is considered to be successful
+			return nil
+		}
+
+		return err
+	}
+
+	err = c.Tasks().WaitForTask(ctx, *taskID)
+	if err != nil {
+		return fmt.Errorf("error waiting for container volume move: %w", err)
+	}
+
+	return nil
+}
+
+// MoveContainerVolumeAsync moves a container volume asynchronously.
+func (c *Client) MoveContainerVolumeAsync(ctx context.Context, d *MoveDiskRequestBody) (*string, error) {
+	resBody := &MoveDiskResponseBody{}
+
+	err := c.DoRequest(ctx, http.MethodPost, c.ExpandPath("move_volume"), d, resBody)
+	if err != nil {
+		return nil, fmt.Errorf("error moving container volume: %w", err)
+	}
+
+	if resBody.Data == nil {
+		return nil, api.ErrNoDataObjectInResponse
+	}
+
+	return resBody.Data, nil
+}
+
+// ResizeContainerVolumeAsync resizes a container volume asynchronously.
+func (c *Client) ResizeContainerVolumeAsync(ctx context.Context, d *ResizeDiskRequestBody) (*string, error) {
+	resBody := &MoveDiskResponseBody{}
+
+	err := c.DoRequest(ctx, http.MethodPut, c.ExpandPath("resize"), d, resBody)
+	if err != nil {
+		return nil, fmt.Errorf("error resizing container disk: %w", err)
+	}
+
+	if resBody.Data == nil {
+		return nil, api.ErrNoDataObjectInResponse
+	}
+
+	return resBody.Data, nil
+}
+
+// ResizeContainerVolume resizes a container volume.
+func (c *Client) ResizeContainerVolume(ctx context.Context, d *ResizeDiskRequestBody) error {
+	err := retry.Do(
+		func() error {
+			taskID, err := c.ResizeContainerVolumeAsync(ctx, d)
+			if err != nil {
+				return err
+			}
+
+			return c.Tasks().WaitForTask(ctx, *taskID)
+		},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.Delay(1*time.Second),
+		retry.LastErrorOnly(false),
+		retry.RetryIf(func(err error) bool {
+			return strings.Contains(err.Error(), "got timeout")
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("error waiting for container volume resize: %w", err)
+	}
+
+	return nil
+}
+
 // WaitForContainerStatus waits for a container to reach a specific state.
 func (c *Client) WaitForContainerStatus(ctx context.Context, status string) error {
 	status = strings.ToLower(status)

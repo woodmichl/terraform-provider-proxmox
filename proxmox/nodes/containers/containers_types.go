@@ -216,6 +216,28 @@ type GetStatusResponseData struct {
 	VMID             *types.CustomInt `json:"vmid,omitempty"`
 }
 
+// ResizeDiskRequestBody contains the body for a container resize disk request.
+type ResizeDiskRequestBody struct {
+	Digest *string        `json:"digest,omitempty" url:"digest,omitempty"`
+	Disk   string         `json:"disk"             url:"disk"`
+	Size   types.DiskSize `json:"size"             url:"size"`
+}
+
+// MoveDiskRequestBody contains the body for a VM move disk request.
+type MoveDiskRequestBody struct {
+	BandwidthLimit      *int              `json:"bwlimit,omitempty" url:"bwlimit,omitempty"`
+	DeleteOriginalDisk  *types.CustomBool `json:"delete,omitempty"  url:"delete,omitempty,int"`
+	Digest              *string           `json:"digest,omitempty"  url:"digest,omitempty"`
+	Volume              string            `json:"volume"            url:"volume"`
+	TargetStorage       string            `json:"storage"           url:"storage"`
+	TargetStorageFormat *string           `json:"format,omitempty"  url:"format,omitempty"`
+}
+
+// MoveDiskResponseBody contains the body from a container move disk response.
+type MoveDiskResponseBody struct {
+	Data *string `json:"data,omitempty"`
+}
+
 // StartResponseBody contains the body from a container start response.
 type StartResponseBody struct {
 	Data *string `json:"data,omitempty"`
